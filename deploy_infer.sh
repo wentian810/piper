@@ -21,10 +21,6 @@ set -euo pipefail
 #   CONTROL_HZ=15            # 控制循环频率；与相机 FPS 区分开，决定每秒推理和发送动作的次数
 #   LPF_ALPHA=1.0            # 动作低通滤波系数；1.0 表示不滤波，越小越平滑但响应越慢，建议先试 0.2~0.5
 #   SEND_REPEAT=1            # 每次推理得到的同一个动作重复发送次数；1 表示只发送一次，可用于测试通信/执行稳定性
-#   STUCK_DETECT_WINDOW=0    # 卡住检测窗口步数；0 表示关闭，>0 时若连续多步关节状态变化很小则触发脱困信号
-#   STUCK_ESCAPE_STEPS=3     # 触发卡住后连续输出脱困动作的步数；用于短暂打破僵局，然后回到策略控制
-#   STUCK_ESCAPE_SCALE=0.03  # 脱困动作幅度；会沿着策略想去但机械臂没动起来的方向额外推进，建议从小值开始
-#   STUCK_COOLDOWN_STEPS=20  # 每次脱困后的冷却步数；避免在同一位置连续频繁触发脱困
 
 POLICY_PATH="${POLICY_PATH:-/home/bbncf305/lerobot513/DP/lerobot_piper3/outputs/train/diffusion_piper2/checkpoints/060000/pretrained_model}"
 CAM_AZURE="${CAM_AZURE:-/dev/video6}"
@@ -39,10 +35,6 @@ ACTION_SCALE="${ACTION_SCALE:-1}"
 CONTROL_HZ="${CONTROL_HZ:-15}"
 LPF_ALPHA="${LPF_ALPHA:-0.8}"
 SEND_REPEAT="${SEND_REPEAT:-1}"
-STUCK_DETECT_WINDOW="${STUCK_DETECT_WINDOW:-5}"
-STUCK_ESCAPE_STEPS="${STUCK_ESCAPE_STEPS:-8}"
-STUCK_ESCAPE_SCALE="${STUCK_ESCAPE_SCALE:-0.3}"
-STUCK_COOLDOWN_STEPS="${STUCK_COOLDOWN_STEPS:-1}"
 
 printf '\n========== LeRobot 纯推理启动 =========='
 printf '\npolicy 路径: %s' "$POLICY_PATH"
@@ -57,17 +49,12 @@ printf '\naction_scale: %s' "$ACTION_SCALE"
 printf '\ncontrol_hz: %s' "$CONTROL_HZ"
 printf '\nlpf_alpha: %s' "$LPF_ALPHA"
 printf '\nsend_repeat: %s' "$SEND_REPEAT"
-printf '\nstuck_detect_window: %s' "$STUCK_DETECT_WINDOW"
-printf '\nstuck_escape_steps: %s' "$STUCK_ESCAPE_STEPS"
-printf '\nstuck_escape_scale: %s' "$STUCK_ESCAPE_SCALE"
-printf '\nstuck_cooldown_steps: %s' "$STUCK_COOLDOWN_STEPS"
 printf '\n======================================\n\n'
 
-python - "$POLICY_PATH" "$CAM_AZURE" "$CAM_REALSENSE" "$ROBOT_ID" "$FPS" "$MAX_STEPS" "$USE_AMP" "$POLICY_DEVICE" "$DEBUG" "$ACTION_SCALE" "$CONTROL_HZ" "$LPF_ALPHA" "$SEND_REPEAT" "$STUCK_DETECT_WINDOW" "$STUCK_ESCAPE_STEPS" "$STUCK_ESCAPE_SCALE" "$STUCK_COOLDOWN_STEPS" <<'PY'
+python - "$POLICY_PATH" "$CAM_AZURE" "$CAM_REALSENSE" "$ROBOT_ID" "$FPS" "$MAX_STEPS" "$USE_AMP" "$POLICY_DEVICE" "$DEBUG" "$ACTION_SCALE" "$CONTROL_HZ" "$LPF_ALPHA" "$SEND_REPEAT" <<'PY'
 import signal
 import sys
 import time
-from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -99,11 +86,7 @@ register_third_party_plugins()
     control_hz,
     lpf_alpha,
     send_repeat,
-    stuck_detect_window,
-    stuck_escape_steps,
-    stuck_escape_scale,
-    stuck_cooldown_steps,
-) = sys.argv[1:18]
+) = sys.argv[1:14]
 policy_path = Path(policy_path)
 fps = int(fps)
 max_steps = int(max_steps)
@@ -113,10 +96,6 @@ action_scale = float(action_scale)
 control_hz = float(control_hz)
 lpf_alpha = float(lpf_alpha)
 send_repeat = int(send_repeat)
-stuck_detect_window = int(stuck_detect_window)
-stuck_escape_steps = int(stuck_escape_steps)
-stuck_escape_scale = float(stuck_escape_scale)
-stuck_cooldown_steps = int(stuck_cooldown_steps)
 
 if fps <= 0:
     raise ValueError(f"FPS must be > 0, got {fps}")
@@ -126,14 +105,6 @@ if not 0.0 < lpf_alpha <= 1.0:
     raise ValueError(f"LPF_ALPHA must be in (0, 1], got {lpf_alpha}")
 if send_repeat < 1:
     raise ValueError(f"SEND_REPEAT must be >= 1, got {send_repeat}")
-if stuck_detect_window < 0:
-    raise ValueError(f"STUCK_DETECT_WINDOW must be >= 0, got {stuck_detect_window}")
-if stuck_escape_steps < 0:
-    raise ValueError(f"STUCK_ESCAPE_STEPS must be >= 0, got {stuck_escape_steps}")
-if stuck_escape_scale < 0:
-    raise ValueError(f"STUCK_ESCAPE_SCALE must be >= 0, got {stuck_escape_scale}")
-if stuck_cooldown_steps < 0:
-    raise ValueError(f"STUCK_COOLDOWN_STEPS must be >= 0, got {stuck_cooldown_steps}")
 
 
 def _print_debug(prefix, x):
@@ -215,11 +186,6 @@ print("\n[INFO] Connected. Starting pure inference loop for follower arm only. P
 
 step = 0
 last_filtered_action = None
-state_history = deque(maxlen=stuck_detect_window if stuck_detect_window > 0 else 1)
-stuck_state_epsilon = 1e-3
-stuck_escape_remaining = 0
-stuck_cooldown_remaining = 0
-stuck_escape_direction = None
 control_dt = 1.0 / control_hz
 try:
     while not stop:
@@ -276,18 +242,6 @@ try:
             last_filtered_action = filtered_action.clone()
             action_tensor = filtered_action
 
-        if stuck_cooldown_remaining > 0:
-            stuck_cooldown_remaining -= 1
-
-        if stuck_escape_remaining > 0 and stuck_escape_direction is not None:
-            # 脱困信号：在策略动作基础上，沿“策略想去但机械臂没动起来”的方向额外推进一点。
-            # 只作用于 6 个机械臂关节，不改 gripper，避免夹爪被脱困逻辑误触发。
-            action_tensor[:6] = action_tensor[:6] + stuck_escape_scale * stuck_escape_direction
-            stuck_escape_remaining -= 1
-            print(f"[ESCAPE] 正在输出脱困动作: remaining={stuck_escape_remaining}, scale={stuck_escape_scale}")
-            if last_filtered_action is not None:
-                last_filtered_action = action_tensor.clone()
-
         robot_action = {f"{motor}.pos": float(action_tensor[i]) for i, motor in enumerate(motor_order)}
         _print_debug("robot_action", robot_action)
 
@@ -298,37 +252,6 @@ try:
                 _print_debug(f"sent_action[{repeat_idx + 1}/{send_repeat}]", sent_action)
         if not (debug and send_repeat > 1):
             _print_debug("sent_action", sent_action)
-
-        if stuck_detect_window > 0:
-            state_history.append(current_state.copy())
-            if len(state_history) == stuck_detect_window:
-                state_delta = float(np.max(np.abs(state_history[-1] - state_history[0])))
-                desired_delta = action_tensor.detach().cpu().numpy()[:6] - current_state[:6]
-                action_delta = float(np.max(np.abs(desired_delta)))
-                can_escape = (
-                    stuck_escape_steps > 0
-                    and stuck_escape_scale > 0.0
-                    and stuck_escape_remaining == 0
-                    and stuck_cooldown_remaining == 0
-                )
-                if state_delta < stuck_state_epsilon and action_delta > stuck_state_epsilon and can_escape:
-                    norm = float(np.linalg.norm(desired_delta))
-                    if norm > 1e-9:
-                        stuck_escape_direction = torch.from_numpy(desired_delta / norm).to(action_tensor)
-                        stuck_escape_remaining = stuck_escape_steps
-                        stuck_cooldown_remaining = stuck_cooldown_steps
-                        state_history.clear()
-                        print(
-                            f"[ESCAPE] 检测到卡住，开始输出脱困信号: window={stuck_detect_window}, "
-                            f"state_delta={state_delta:.6f}, action_delta={action_delta:.6f}, "
-                            f"escape_steps={stuck_escape_steps}, escape_scale={stuck_escape_scale}"
-                        )
-                elif state_delta < stuck_state_epsilon and action_delta > stuck_state_epsilon:
-                    print(
-                        f"[WARN] 可能卡住但暂不触发脱困: state_delta={state_delta:.6f}, "
-                        f"action_delta={action_delta:.6f}, escape_remaining={stuck_escape_remaining}, "
-                        f"cooldown_remaining={stuck_cooldown_remaining}"
-                    )
 
         step += 1
         if step % 10 == 0:

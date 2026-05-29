@@ -1,4 +1,4 @@
-#!/usr/bin/env bash
+ #!/usr/bin/env bash
 set -euo pipefail
 
 # Usage:
@@ -26,6 +26,12 @@ set -euo pipefail
 #   SCHEDULER_NAME=cosine
 #   WARMUP_STEPS=500
 #   GRAD_CLIP_NORM=10.0
+#
+#   # ====== Transformer (replaces CNN-UNet) ======
+#   USE_TRANSFORMER=false
+#   N_LAYERS=4
+#   N_HEADS=8
+#   N_EMB=256
 
 # ──────────── Dataset / Output ────────────
 DATASET_ROOT="${DATASET_ROOT:-/home/bbncf305/lerobot513/DP/lerobot_piper3/datasets/piper3}"
@@ -56,6 +62,12 @@ LOG_FREQ="${LOG_FREQ:-1000}"
 SCHEDULER_NAME="${SCHEDULER_NAME:-cosine}"
 WARMUP_STEPS="${WARMUP_STEPS:-500}"
 
+# ──────────── Transformer ────────────
+USE_TRANSFORMER="${USE_TRANSFORMER:-false}"
+N_LAYERS="${N_LAYERS:-4}"
+N_HEADS="${N_HEADS:-8}"
+N_EMB="${N_EMB:-256}"
+
 # ═══════════════════════════════════════════════
 printf '\n========== LeRobot Diffusion 训练启动 =========='
 printf '\n数据集路径: %s' "$DATASET_ROOT"
@@ -79,6 +91,8 @@ printf '\ngrad_clip_norm: %s' "$GRAD_CLIP_NORM"
 printf '\n--- Scheduler ---'
 printf '\nscheduler: %s' "$SCHEDULER_NAME"
 printf '\nwarmup_steps: %s' "$WARMUP_STEPS"
+printf '\n--- Transformer ---'
+printf '\nuse_transformer: %s' "$USE_TRANSFORMER"
 printf '\n=============================================\n\n'
 
 lerobot-train \
@@ -87,6 +101,10 @@ lerobot-train \
   --policy.type=diffusion \
   --policy.use_separate_rgb_encoder_per_camera=true \
   --policy.crop_shape='[480,640]' \
+  --policy.n_obs_steps=16 \
+  --policy.horizon=128 \
+  --policy.n_action_steps=64 \
+  --policy.drop_n_last_frames=49 \
   --policy.push_to_hub=false \
   --output_dir="${OUTPUT_DIR}" \
   --job_name="${JOB_NAME}" \
@@ -98,13 +116,13 @@ lerobot-train \
   --policy.device="${POLICY_DEVICE}" \
   --wandb.enable="${WANDB_ENABLE}" \
   --log_freq="${LOG_FREQ}" \
-  \
-  # ── Optimizer ──
+  --policy.use_transformer="${USE_TRANSFORMER}" \
+  --policy.n_layers="${N_LAYERS}" \
+  --policy.n_heads="${N_HEADS}" \
+  --policy.n_emb="${N_EMB}" \
   --policy.optimizer_lr="${LR}" \
   --policy.optimizer_betas="${OPTIM_BETAS}" \
   --policy.optimizer_eps="${OPTIM_EPS}" \
   --policy.optimizer_weight_decay="${WEIGHT_DECAY}" \
-  \
-  # ── Scheduler ──
   --policy.scheduler_name="${SCHEDULER_NAME}" \
   --policy.scheduler_warmup_steps="${WARMUP_STEPS}"

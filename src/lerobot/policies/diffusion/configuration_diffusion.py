@@ -126,6 +126,15 @@ class DiffusionConfig(PreTrainedConfig):
     n_groups: int = 8
     diffusion_step_embed_dim: int = 128
     use_film_scale_modulation: bool = True
+    # Transformer (replaces the CNN-UNet entirely when enabled).
+    use_transformer: bool = False
+    n_layers: int = 4
+    n_heads: int = 8
+    n_emb: int = 256
+    causal_attn: bool = False
+    # Multi-task (Transformer only).
+    num_tasks: int = 1  # >1 to enable task embedding
+    active_task_id: int = 0  # task ID used during online inference
     # Noise scheduler.
     noise_scheduler_type: str = "DDPM"
     num_train_timesteps: int = 100
@@ -176,13 +185,14 @@ class DiffusionConfig(PreTrainedConfig):
             )
 
         # Check that the horizon size and U-Net downsampling is compatible.
-        # U-Net downsamples by 2 with each stage.
-        downsampling_factor = 2 ** len(self.down_dims)
-        if self.horizon % downsampling_factor != 0:
-            raise ValueError(
-                "The horizon should be an integer multiple of the downsampling factor (which is determined "
-                f"by `len(down_dims)`). Got {self.horizon=} and {self.down_dims=}"
-            )
+        # U-Net downsamples by 2 with each stage (only relevant when not using transformer).
+        if not self.use_transformer:
+            downsampling_factor = 2 ** len(self.down_dims)
+            if self.horizon % downsampling_factor != 0:
+                raise ValueError(
+                    "The horizon should be an integer multiple of the downsampling factor (which is determined "
+                    f"by `len(down_dims)`). Got {self.horizon=} and {self.down_dims=}"
+                )
 
     def get_optimizer_preset(self) -> AdamConfig:
         return AdamConfig(

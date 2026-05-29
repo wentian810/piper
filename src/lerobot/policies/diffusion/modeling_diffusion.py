@@ -229,7 +229,26 @@ class DiffusionModel(nn.Module):
         if self.config.env_state_feature:
             global_cond_dim += self.config.env_state_feature.shape[0]
 
-        self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
+        if not self.config.use_transformer:
+            self.model = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
+        else:
+            self.model = TransformerForDiffusion(
+                input_dim=config.action_feature.shape[0],
+                output_dim=config.action_feature.shape[0],
+                horizon=config.horizon,
+                n_obs_steps=config.n_obs_steps,
+                cond_dim=global_cond_dim,
+                n_layer=config.n_layers,
+                n_head=config.n_heads,
+                n_emb=config.n_emb,
+                p_drop_emb=0.1,
+                p_drop_attn=0.1,
+                causal_attn=config.causal_attn,
+                time_as_cond=True,
+                obs_as_cond=True,
+                n_cond_layers=0,
+                num_tasks=config.num_tasks,
+            )
 
         self.noise_scheduler = _make_noise_scheduler(
             config.noise_scheduler_type,
@@ -254,6 +273,7 @@ class DiffusionModel(nn.Module):
         global_cond: Tensor | None = None,
         generator: torch.Generator | None = None,
         noise: Tensor | None = None,
+        task_ids: Tensor | None = None,
     ) -> Tensor:
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
@@ -274,11 +294,19 @@ class DiffusionModel(nn.Module):
 
         for t in self.noise_scheduler.timesteps:
             # Predict model output.
-            model_output = self.unet(
-                sample,
-                torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
-                global_cond=global_cond,
-            )
+            if self.config.use_transformer:
+                model_output = self.model(
+                    sample,
+                    torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
+                    global_cond=global_cond,
+                    task_ids=task_ids,
+                )
+            else:
+                model_output = self.model(
+                    sample,
+                    torch.full(sample.shape[:1], t, dtype=torch.long, device=sample.device),
+                    global_cond=global_cond,
+                )
             # Compute previous image: x_t -> x_t-1
             sample = self.noise_scheduler.step(model_output, t, sample, generator=generator).prev_sample
 
@@ -320,7 +348,12 @@ class DiffusionModel(nn.Module):
         if self.config.env_state_feature:
             global_cond_feats.append(batch[OBS_ENV_STATE])
 
-        return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
+        if self.config.use_transformer:
+            # For Transformer, keep the temporal dim: (B, To, cond_dim) for cross-attention.
+            return torch.cat(global_cond_feats, dim=-1)
+        else:
+            # For CNN-UNet, flatten to (B, global_cond_dim) for FiLM modulation.
+            return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
 
     def _trajectory_to_training_target(self, batch: dict[str, Tensor]) -> Tensor:
         return batch[ACTION]
@@ -345,8 +378,18 @@ class DiffusionModel(nn.Module):
         # Encode image features and concatenate them all together along with the state vector.
         global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
 
+        # Extract task_ids from batch if present (offline eval), else use active_task_id (online inference).
+        task_ids = batch.get("task_index", None)
+        if task_ids is not None:
+            task_ids = task_ids.squeeze(-1).long()  # [B, 1] -> [B]
+        else:
+            task_ids = torch.full(
+                (batch_size,), self.config.active_task_id, dtype=torch.long,
+                device=get_device_from_parameters(self),
+            )
+
         # run sampling
-        actions = self.conditional_sample(batch_size, global_cond=global_cond, noise=noise)
+        actions = self.conditional_sample(batch_size, global_cond=global_cond, noise=noise, task_ids=task_ids)
 
         # Extract `n_action_steps` steps worth of actions (from the current observation).
         start = n_obs_steps - 1
@@ -394,8 +437,16 @@ class DiffusionModel(nn.Module):
         # Add noise to the clean trajectories according to the noise magnitude at each timestep.
         noisy_trajectory = self.noise_scheduler.add_noise(trajectory, eps, timesteps)
 
+        # Extract task_ids for multi-task training.
+        task_ids = batch.get("task_index", None)
+        if task_ids is not None:
+            task_ids = task_ids.squeeze(-1).long()  # [B, 1] -> [B]
+
         # Run the denoising network (that might denoise the trajectory, or attempt to predict the noise).
-        pred = self.unet(noisy_trajectory, timesteps, global_cond=global_cond)
+        if self.config.use_transformer:
+            pred = self.model(noisy_trajectory, timesteps, global_cond=global_cond, task_ids=task_ids)
+        else:
+            pred = self.model(noisy_trajectory, timesteps, global_cond=global_cond)
 
         # Compute the loss.
         # The target is either the original trajectory, or the noise.
@@ -818,3 +869,344 @@ class DiffusionConditionalResidualBlock1d(nn.Module):
         out = self.conv2(out)
         out = out + self.residual_conv(x)
         return out
+
+
+class ModuleAttrMixin(nn.Module):
+    """Mixin that provides .device and .dtype properties from module parameters."""
+
+    def __init__(self):
+        super().__init__()
+        self._dummy_variable = nn.Parameter()
+
+    @property
+    def device(self):
+        return next(iter(self.parameters())).device
+
+    @property
+    def dtype(self):
+        return next(iter(self.parameters())).dtype
+
+
+class TransformerForDiffusion(ModuleAttrMixin):
+    """Transformer-based diffusion head that replaces the CNN-UNet.
+
+    Uses a Transformer Decoder with cross-attention over a condition encoder
+    (image features + robot state + diffusion timestep) to predict noise from
+    noisy action trajectories.
+
+    Ported from https://github.com/box2ai-robotics/lerobot-joycon.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        output_dim: int,
+        horizon: int,
+        n_obs_steps: int | None = None,
+        cond_dim: int = 0,
+        n_layer: int = 12,
+        n_head: int = 12,
+        n_emb: int = 768,
+        p_drop_emb: float = 0.1,
+        p_drop_attn: float = 0.1,
+        causal_attn: bool = False,
+        time_as_cond: bool = True,
+        obs_as_cond: bool = False,
+        n_cond_layers: int = 0,
+        num_tasks: int = 1,
+    ) -> None:
+        super().__init__()
+
+        if n_obs_steps is None:
+            n_obs_steps = horizon
+
+        T = horizon
+        T_cond = 1
+        if not time_as_cond:
+            T += 1
+            T_cond -= 1
+        obs_as_cond = cond_dim > 0
+        if obs_as_cond:
+            assert time_as_cond
+            T_cond += n_obs_steps
+
+        # Input embedding stem.
+        self.input_emb = nn.Linear(input_dim, n_emb)
+        self.pos_emb = nn.Parameter(torch.zeros(1, T, n_emb))
+        self.drop = nn.Dropout(p_drop_emb)
+
+        # Condition encoder.
+        self.time_emb = DiffusionSinusoidalPosEmb(n_emb)
+        self.cond_obs_emb = None
+
+        if obs_as_cond:
+            self.cond_obs_emb = nn.Linear(cond_dim, n_emb)
+
+        # Task embedding for multi-task training.
+        self.task_emb = None
+        if num_tasks > 1:
+            self.task_emb = nn.Embedding(num_tasks, n_emb)
+            T_cond += 1  # extra condition token for the task
+
+        self.cond_pos_emb = None
+        self.encoder = None
+        self.decoder = None
+        encoder_only = False
+        if T_cond > 0:
+            self.cond_pos_emb = nn.Parameter(torch.zeros(1, T_cond, n_emb))
+            if n_cond_layers > 0:
+                encoder_layer = nn.TransformerEncoderLayer(
+                    d_model=n_emb,
+                    nhead=n_head,
+                    dim_feedforward=4 * n_emb,
+                    dropout=p_drop_attn,
+                    activation="gelu",
+                    batch_first=True,
+                    norm_first=True,
+                )
+                self.encoder = nn.TransformerEncoder(
+                    encoder_layer=encoder_layer, num_layers=n_cond_layers
+                )
+            else:
+                self.encoder = nn.Sequential(
+                    nn.Linear(n_emb, 4 * n_emb),
+                    nn.Mish(),
+                    nn.Linear(4 * n_emb, n_emb),
+                )
+            # Decoder.
+            decoder_layer = nn.TransformerDecoderLayer(
+                d_model=n_emb,
+                nhead=n_head,
+                dim_feedforward=4 * n_emb,
+                dropout=p_drop_attn,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.decoder = nn.TransformerDecoder(
+                decoder_layer=decoder_layer, num_layers=n_layer
+            )
+        else:
+            # Encoder-only (BERT-style).
+            encoder_only = True
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=n_emb,
+                nhead=n_head,
+                dim_feedforward=4 * n_emb,
+                dropout=p_drop_attn,
+                activation="gelu",
+                batch_first=True,
+                norm_first=True,
+            )
+            self.encoder = nn.TransformerEncoder(
+                encoder_layer=encoder_layer, num_layers=n_layer
+            )
+
+        # Attention masks.
+        if causal_attn:
+            sz = T
+            mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
+            mask = (
+                mask.float()
+                .masked_fill(mask == 0, float("-inf"))
+                .masked_fill(mask == 1, float(0.0))
+            )
+            self.register_buffer("mask", mask)
+
+            if time_as_cond and obs_as_cond:
+                S = T_cond
+                t, s = torch.meshgrid(
+                    torch.arange(T), torch.arange(S), indexing="ij"
+                )
+                mask = t >= (s - 1)
+                mask = (
+                    mask.float()
+                    .masked_fill(mask == 0, float("-inf"))
+                    .masked_fill(mask == 1, float(0.0))
+                )
+                self.register_buffer("memory_mask", mask)
+            else:
+                self.memory_mask = None
+        else:
+            self.mask = None
+            self.memory_mask = None
+
+        # Output head.
+        self.ln_f = nn.LayerNorm(n_emb)
+        self.head = nn.Linear(n_emb, output_dim)
+
+        # Constants.
+        self.T = T
+        self.T_cond = T_cond
+        self.horizon = horizon
+        self.time_as_cond = time_as_cond
+        self.obs_as_cond = obs_as_cond
+        self.encoder_only = encoder_only
+
+        # Init.
+        self.apply(self._init_weights)
+        print("number of parameters: %e", sum(p.numel() for p in self.parameters()))
+
+    def _init_weights(self, module):
+        ignore_types = (
+            nn.Dropout,
+            DiffusionSinusoidalPosEmb,
+            nn.TransformerEncoderLayer,
+            nn.TransformerDecoderLayer,
+            nn.TransformerEncoder,
+            nn.TransformerDecoder,
+            nn.ModuleList,
+            nn.Mish,
+            nn.Sequential,
+        )
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if isinstance(module, nn.Linear) and module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.MultiheadAttention):
+            weight_names = [
+                "in_proj_weight",
+                "q_proj_weight",
+                "k_proj_weight",
+                "v_proj_weight",
+            ]
+            for name in weight_names:
+                weight = getattr(module, name)
+                if weight is not None:
+                    torch.nn.init.normal_(weight, mean=0.0, std=0.02)
+
+            bias_names = ["in_proj_bias", "bias_k", "bias_v"]
+            for name in bias_names:
+                bias = getattr(module, name)
+                if bias is not None:
+                    torch.nn.init.zeros_(bias)
+        elif isinstance(module, nn.LayerNorm):
+            torch.nn.init.zeros_(module.bias)
+            torch.nn.init.ones_(module.weight)
+        elif isinstance(module, TransformerForDiffusion):
+            torch.nn.init.normal_(module.pos_emb, mean=0.0, std=0.02)
+            if module.cond_obs_emb is not None:
+                torch.nn.init.normal_(module.cond_pos_emb, mean=0.0, std=0.02)
+        elif isinstance(module, ignore_types):
+            pass
+        else:
+            raise RuntimeError("Unaccounted module {}".format(module))
+
+    def get_optim_groups(self, weight_decay: float = 1e-3):
+        """Separate params into weight-decay and no-weight-decay groups."""
+        decay = set()
+        no_decay = set()
+        whitelist_weight_modules = (torch.nn.Linear, torch.nn.MultiheadAttention)
+        blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding)
+        for mn, m in self.named_modules():
+            for pn, p in m.named_parameters():
+                fpn = "%s.%s" % (mn, pn) if mn else pn
+                if pn.endswith("bias"):
+                    no_decay.add(fpn)
+                elif pn.startswith("bias"):
+                    no_decay.add(fpn)
+                elif pn.endswith("weight") and isinstance(m, whitelist_weight_modules):
+                    decay.add(fpn)
+                elif pn.endswith("weight") and isinstance(m, blacklist_weight_modules):
+                    no_decay.add(fpn)
+
+        no_decay.add("pos_emb")
+        no_decay.add("_dummy_variable")
+        if self.cond_pos_emb is not None:
+            no_decay.add("cond_pos_emb")
+
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        inter_params = decay & no_decay
+        union_params = decay | no_decay
+        assert len(inter_params) == 0, "parameters %s made it into both decay/no_decay sets!" % (str(inter_params),)
+        assert len(param_dict.keys() - union_params) == 0, (
+            "parameters %s were not separated into either decay/no_decay set!"
+            % (str(param_dict.keys() - union_params),)
+        )
+
+        optim_groups = [
+            {"params": [param_dict[pn] for pn in sorted(decay)], "weight_decay": weight_decay},
+            {"params": [param_dict[pn] for pn in sorted(no_decay)], "weight_decay": 0.0},
+        ]
+        return optim_groups
+
+    def configure_optimizers(
+        self,
+        learning_rate: float = 1e-4,
+        weight_decay: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.95),
+    ):
+        optim_groups = self.get_optim_groups(weight_decay=weight_decay)
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
+        return optimizer
+
+    def forward(
+        self,
+        sample: torch.Tensor,
+        timestep: torch.Tensor | float | int,
+        global_cond: torch.Tensor | None = None,
+        **kwargs,
+    ):
+        """
+        Args:
+            sample: (B, T, input_dim) noisy action trajectory.
+            timestep: (B,) or int, current diffusion timestep.
+            global_cond: (B, To, cond_dim) condition features (image + state).
+        Returns:
+            (B, T, output_dim) predicted noise or clean trajectory.
+        """
+        # 1. Time embedding.
+        timesteps = timestep
+        if not torch.is_tensor(timesteps):
+            timesteps = torch.tensor([timesteps], dtype=torch.long, device=sample.device)
+        elif torch.is_tensor(timesteps) and len(timesteps.shape) == 0:
+            timesteps = timesteps[None].to(sample.device)
+        timesteps = timesteps.expand(sample.shape[0])
+        time_emb = self.time_emb(timesteps).unsqueeze(1)  # (B, 1, n_emb)
+
+        # Process action input.
+        input_emb = self.input_emb(sample)  # (B, T, n_emb)
+
+        if self.encoder_only:
+            # BERT-style: concatenate time + action tokens.
+            token_embeddings = torch.cat([time_emb, input_emb], dim=1)
+            t = token_embeddings.shape[1]
+            position_embeddings = self.pos_emb[:, :t, :]
+            x = self.drop(token_embeddings + position_embeddings)
+            x = self.encoder(src=x, mask=self.mask)
+            x = x[:, 1:, :]  # Remove time token.
+        else:
+            # Encoder: condition tokens (time [+ task] + global_cond).
+            cond_embeddings = time_emb
+
+            # Insert task embedding token if multi-task.
+            task_ids = kwargs.get("task_ids", None)
+            if self.task_emb is not None:
+                if task_ids is None:
+                    task_ids = torch.zeros(sample.shape[0], dtype=torch.long, device=sample.device)
+                cond_embeddings = torch.cat([cond_embeddings, self.task_emb(task_ids).unsqueeze(1)], dim=1)
+
+            if self.obs_as_cond:
+                cond_obs_emb = self.cond_obs_emb(global_cond)  # (B, To, n_emb)
+                cond_embeddings = torch.cat([cond_embeddings, cond_obs_emb], dim=1)
+            tc = cond_embeddings.shape[1]
+            position_embeddings = self.cond_pos_emb[:, :tc, :]
+            x = self.drop(cond_embeddings + position_embeddings)
+            x = self.encoder(x)
+            memory = x  # (B, T_cond, n_emb)
+
+            # Decoder: action tokens cross-attend to condition memory.
+            t = input_emb.shape[1]
+            position_embeddings = self.pos_emb[:, :t, :]
+            x = self.drop(input_emb + position_embeddings)
+            x = self.decoder(
+                tgt=x,
+                memory=memory,
+                tgt_mask=self.mask,
+                memory_mask=self.memory_mask,
+            )
+
+        # Output head.
+        x = self.ln_f(x)
+        x = self.head(x)  # (B, T, output_dim)
+        return x
