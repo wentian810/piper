@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rm -v e:/vla/piper/requirements-macos.txt e:/vla/piper/requirements-ubuntu.txt e:/vla/piper/requirements.in e:/vla/piper/docs-requirements.txt e:/vla/piper/README.md e:/vla/piper/SECURITY.md e:/vla/piper/LICENSE e:/vla/piper/Makefile e:/vla/piper/MANIFEST.in)"
+    ],
+    "additionalDirectories": [
+      "e:\\vla\\piper"
+    ]
+  }
+}
